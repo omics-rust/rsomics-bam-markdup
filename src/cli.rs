@@ -47,7 +47,9 @@ impl Cli {
             Box::new(std::fs::File::create(&self.output).map_err(RsomicsError::Io)?)
         };
 
-        let stats = markdup(&self.input, &mut out, &opts)?;
+        let workers = std::num::NonZero::new(self.common.thread_count())
+            .unwrap_or(std::num::NonZero::<usize>::MIN);
+        let stats = markdup(&self.input, &mut out, &opts, workers)?;
 
         if self.common.json {
             eprintln!(
