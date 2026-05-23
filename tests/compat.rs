@@ -43,8 +43,23 @@ fn dup_records(bam: &Path) -> Vec<(String, u16)> {
     records
 }
 
-/// Run samtools fixmate+markdup pipeline and our tool on the same SAM, then
-/// compare the sets of reads flagged as duplicates.
+/// Every alignment record decoded to SAM text, in stream order — the strongest
+/// byte-exact check (flags + all fields), modulo the header `@PG` line that
+/// samtools adds and we do not.
+fn all_records(bam: &Path) -> String {
+    let out = Command::new("samtools")
+        .arg("view")
+        .arg(bam)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Run samtools fixmate+markdup pipeline and our tool on the same coordinate-
+/// sorted, fixmate-m'd BAM, then assert every output record is byte-exact
+/// (including the duplicate flag) against `samtools markdup`. Our tool consumes
+/// the same fixmate-m'd input samtools markdup requires (MC + ms tags).
 fn run_compat(sam: &Path, dir: &Path, tag: &str) {
     let all = dir.join(format!("{tag}_all.bam"));
     {
@@ -84,7 +99,7 @@ fn run_compat(sam: &Path, dir: &Path, tag: &str) {
     let smd = dir.join(format!("{tag}_smd.bam"));
     run_ok(Command::new("samtools").arg("markdup").arg(&cs).arg(&smd));
 
-    // our tool operates on the same coordinate-sorted BAM (no fixmate needed)
+    // our tool operates on the same fixmate-m'd coordinate-sorted BAM
     let omd = dir.join(format!("{tag}_omd.bam"));
     run_ok(ours().arg(&cs).arg("-o").arg(&omd));
 
@@ -92,6 +107,11 @@ fn run_compat(sam: &Path, dir: &Path, tag: &str) {
         dup_records(&omd),
         dup_records(&smd),
         "[{tag}] duplicate-flagged read set must match samtools markdup"
+    );
+    assert_eq!(
+        all_records(&omd),
+        all_records(&smd),
+        "[{tag}] every output record must be byte-exact against samtools markdup"
     );
 }
 
@@ -121,5 +141,23 @@ fn markdup_mixed_se_pe_matches_samtools() {
     let dir = std::env::temp_dir().join("rsomics-bam-markdup-compat-mixed");
     let _ = std::fs::create_dir_all(&dir);
     run_compat(&golden_dir().join("mixed_se_pe.sam"), &dir, "mixed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Streaming + tie-break stress: three identical-score pairs at one position
+// (qname tie-break picks the lexicographically smallest as original), soft-clip
+// pairs that collide via the unclipped coordinate, and reverse-strand pairs.
+// These are exactly the cases that distinguish a faithful samtools-key
+// implementation from a position-only one — the sliding window must keep the
+// colliding members live together and resolve the original by samtools' rules.
+#[test]
+fn markdup_streaming_tiebreak_matches_samtools() {
+    if !samtools_available() {
+        eprintln!("skipping: samtools not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join("rsomics-bam-markdup-compat-tiebreak");
+    let _ = std::fs::create_dir_all(&dir);
+    run_compat(&golden_dir().join("stream_tiebreak.sam"), &dir, "tiebreak");
     let _ = std::fs::remove_dir_all(&dir);
 }
