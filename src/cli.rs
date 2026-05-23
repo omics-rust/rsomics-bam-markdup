@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use rsomics_common::{CommonFlags, Result, RsomicsError, Tool, ToolMeta};
@@ -41,15 +41,15 @@ impl Cli {
             remove: self.remove,
         };
 
-        let mut out: Box<dyn std::io::Write> = if self.output == "-" {
-            Box::new(std::io::stdout().lock())
+        let output_path: Option<&Path> = if self.output == "-" {
+            None
         } else {
-            Box::new(std::fs::File::create(&self.output).map_err(RsomicsError::Io)?)
+            Some(Path::new(&self.output))
         };
 
         let workers = std::num::NonZero::new(self.common.thread_count())
             .unwrap_or(std::num::NonZero::<usize>::MIN);
-        let stats = markdup(&self.input, &mut out, &opts, workers)?;
+        let stats = markdup(&self.input, output_path, &opts, workers)?;
 
         if self.common.json {
             eprintln!(

@@ -4,12 +4,26 @@ use std::num::NonZero;
 use std::path::Path;
 
 use noodles::bam;
-use noodles::sam;
-use noodles::sam::alignment::io::Write as AlnWrite;
-use noodles::sam::alignment::record::cigar::op::Kind;
-use noodles::sam::alignment::record_buf::RecordBuf;
+use rsomics_bamio::raw::{self, FLAG_DUPLICATE, RawRecord};
 use rsomics_common::{Result, RsomicsError};
 use serde::Serialize;
+
+// SAM/BAM FLAG bits (SAMv1 §1.4); duplicate (0x400) lives in rsomics-bamio.
+const FLAG_SEGMENTED: u16 = 0x1;
+const FLAG_UNMAPPED: u16 = 0x4;
+const FLAG_MATE_UNMAPPED: u16 = 0x8;
+const FLAG_REVERSE: u16 = 0x10;
+const FLAG_MATE_REVERSE: u16 = 0x20;
+const FLAG_SECONDARY: u16 = 0x100;
+const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+// CIGAR op codes (BAM packed encoding, low nibble): M=0 I=1 D=2 N=3 S=4 H=5 P=6 ==7 X=8.
+const CIGAR_MATCH: u8 = 0;
+const CIGAR_DELETION: u8 = 2;
+const CIGAR_SKIP: u8 = 3;
+const CIGAR_SOFT_CLIP: u8 = 4;
+const CIGAR_SEQ_MATCH: u8 = 7;
+const CIGAR_SEQ_MISMATCH: u8 = 8;
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct MarkdupStats {
@@ -23,97 +37,81 @@ pub struct MarkdupOpts {
     pub remove: bool,
 }
 
+fn is_reverse(r: &RawRecord) -> bool {
+    r.flags() & FLAG_REVERSE != 0
+}
+
+fn is_mate_reverse(r: &RawRecord) -> bool {
+    r.flags() & FLAG_MATE_REVERSE != 0
+}
+
+/// 1-based alignment start (BAM stores 0-based; -1 → 0, matching the unmapped
+/// sentinel handling of the prior noodles-based path).
+fn alignment_start_1based(r: &RawRecord) -> i64 {
+    let pos = r.alignment_start();
+    if pos < 0 { 0 } else { i64::from(pos) + 1 }
+}
+
 /// (reference-consuming span, leading soft-clip, trailing soft-clip) from CIGAR.
-fn span_and_clips(record: &bam::Record) -> (i64, i64, i64) {
-    let ops: Vec<_> = record
-        .cigar()
-        .iter()
-        .filter_map(std::result::Result::ok)
-        .collect();
+fn span_and_clips(r: &RawRecord) -> (i64, i64, i64) {
+    let ops: Vec<(u8, u32)> = r.cigar_ops().collect();
     let leading = ops
         .first()
-        .filter(|o| o.kind() == Kind::SoftClip)
-        .map_or(0, |o| o.len() as i64);
+        .filter(|(k, _)| *k == CIGAR_SOFT_CLIP)
+        .map_or(0, |(_, len)| i64::from(*len));
     let trailing = ops
         .last()
-        .filter(|o| o.kind() == Kind::SoftClip)
-        .map_or(0, |o| o.len() as i64);
+        .filter(|(k, _)| *k == CIGAR_SOFT_CLIP)
+        .map_or(0, |(_, len)| i64::from(*len));
     let span: i64 = ops
         .iter()
-        .filter(|o| {
+        .filter(|(k, _)| {
             matches!(
-                o.kind(),
-                Kind::Match
-                    | Kind::Deletion
-                    | Kind::Skip
-                    | Kind::SequenceMatch
-                    | Kind::SequenceMismatch
+                *k,
+                CIGAR_MATCH | CIGAR_DELETION | CIGAR_SKIP | CIGAR_SEQ_MATCH | CIGAR_SEQ_MISMATCH
             )
         })
-        .map(|o| o.len() as i64)
+        .map(|(_, len)| i64::from(*len))
         .sum();
     (span, leading, trailing)
 }
 
-/// Unclipped 5' coordinate (start): forward = pos - leading_clip; same for unclipped_start.
-fn unclipped_start(record: &bam::Record) -> i64 {
-    let pos = record
-        .alignment_start()
-        .and_then(std::result::Result::ok)
-        .map_or(0, |p| p.get() as i64);
-    let (_, lead, _) = span_and_clips(record);
-    pos - lead
+/// Unclipped 5' coordinate (start): forward = pos - leading_clip.
+fn unclipped_start(r: &RawRecord) -> i64 {
+    let (_, lead, _) = span_and_clips(r);
+    alignment_start_1based(r) - lead
 }
 
 /// Unclipped end coordinate: pos + ref_span + trailing_clip.
-fn unclipped_end(record: &bam::Record) -> i64 {
-    let pos = record
-        .alignment_start()
-        .and_then(std::result::Result::ok)
-        .map_or(0, |p| p.get() as i64);
-    let (span, _, trail) = span_and_clips(record);
-    pos + span + trail
+fn unclipped_end(r: &RawRecord) -> i64 {
+    let (span, _, trail) = span_and_clips(r);
+    alignment_start_1based(r) + span + trail
 }
 
 /// Unclipped 5' coordinate: forward = unclipped_start; reverse = unclipped_end.
-fn unclipped_5p(record: &bam::Record) -> i64 {
-    if record.flags().is_reverse_complemented() {
-        unclipped_end(record)
+fn unclipped_5p(r: &RawRecord) -> i64 {
+    if is_reverse(r) {
+        unclipped_end(r)
     } else {
-        unclipped_start(record)
+        unclipped_start(r)
     }
 }
 
-fn tid(record: &bam::Record) -> i64 {
-    record
-        .reference_sequence_id()
-        .and_then(std::result::Result::ok)
-        .map_or(-1, |t| t as i64)
+fn tid(r: &RawRecord) -> i64 {
+    i64::from(r.reference_sequence_id())
 }
 
-fn mate_tid(record: &bam::Record) -> i64 {
-    record
-        .mate_reference_sequence_id()
-        .and_then(std::result::Result::ok)
-        .map_or(-1, |t| t as i64)
+fn mate_tid(r: &RawRecord) -> i64 {
+    i64::from(r.mate_reference_sequence_id())
 }
 
-fn base_qual_sum(record: &bam::Record) -> i64 {
+fn base_qual_sum(r: &RawRecord) -> i64 {
     // samtools markdup sums only base qualities >= 15 (its default threshold).
-    record
-        .quality_scores()
-        .as_ref()
+    r.quality_scores()
         .iter()
         .filter(|&&q| q >= 15)
         .map(|&q| i64::from(q))
         .sum()
-}
-
-fn read_name(record: &bam::Record) -> Vec<u8> {
-    record.name().map_or_else(Vec::new, |n| {
-        let bytes: &[u8] = n.as_ref();
-        bytes.to_vec()
-    })
 }
 
 /// Single-end key: (tid, unclipped_5', is_reverse).
@@ -147,35 +145,24 @@ struct PairKey {
     orientation: u8,
 }
 
-fn single_key_for(record: &bam::Record) -> SingleKey {
+fn single_key_for(r: &RawRecord) -> SingleKey {
     SingleKey {
-        tid: tid(record),
-        coord: unclipped_5p(record),
-        rev: record.flags().is_reverse_complemented(),
+        tid: tid(r),
+        coord: unclipped_5p(r),
+        rev: is_reverse(r),
     }
 }
 
 /// Build the pair key from this read's perspective, given the mate's unclipped_5' coord.
 /// Mirrors samtools template-mode make_pair_key (no barcode/RG).
-fn pair_key_for(record: &bam::Record, mate_5p: i64) -> PairKey {
-    let f = record.flags();
-    let this_ref = tid(record);
-    let other_ref = mate_tid(record);
-    let this_rev = f.is_reverse_complemented();
-    let mate_rev = f.is_mate_reverse_complemented();
+fn pair_key_for(r: &RawRecord, mate_5p: i64) -> PairKey {
+    let this_ref = tid(r);
+    let other_ref = mate_tid(r);
+    let this_rev = is_reverse(r);
+    let mate_rev = is_mate_reverse(r);
 
-    // Compute unclipped start and end for this read.
-    let this_start = unclipped_start(record);
-    let this_end = unclipped_end(record);
-    // Mate's unclipped 5' is mate_5p. We don't have the mate's full span, so
-    // we use mate_5p as both the "other_coord" and accept that this approximates
-    // samtools' template mode which uses both other_start and other_end.
-    // For the standard FR orientation (most common), samtools uses:
-    //   forward read: this_coord = unclipped_start, other_coord = mate_unclipped_end
-    //   reverse read: this_coord = unclipped_end,   other_coord = mate_unclipped_start
-    // Since we have the mate record available (via our name-index), we derive
-    // other_start = mate_5p for forward mate, other_end = mate_5p for reverse mate,
-    // and vice versa for the other coordinate.  This matches unclipped_5p() semantics.
+    let this_start = unclipped_start(r);
+    let this_end = unclipped_end(r);
 
     // Determine leftmost in template mode (mirroring samtools):
     let leftmost = if this_ref != other_ref {
@@ -196,13 +183,6 @@ fn pair_key_for(record: &bam::Record, mate_5p: i64) -> PairKey {
         }
     };
 
-    // Orientation and coordinate selection (mirroring samtools template mode):
-    //   leftmost + (!this_rev && mate_rev) → O_FR, this_coord=this_start, other_coord=mate_5p(=end)
-    //   leftmost + (this_rev && !mate_rev) → O_RF, this_coord=this_end,   other_coord=mate_5p(=start)
-    //   !leftmost + (!this_rev && mate_rev) → O_RF, this_coord=this_start, other_coord=mate_5p
-    //   !leftmost + (this_rev && !mate_rev) → O_FR, this_coord=this_end,   other_coord=mate_5p
-    // For same-orientation FF/RR the orientation encodes read1/read2 role; we simplify
-    // to just (this_rev, mate_rev) which is sufficient to distinguish the four classes.
     let orientation: u8 = match (this_rev, mate_rev) {
         (false, false) => 0, // O_FF
         (true, true) => 1,   // O_RR
@@ -226,41 +206,33 @@ fn pair_key_for(record: &bam::Record, mate_5p: i64) -> PairKey {
 }
 
 /// Entry in the single-hash: record index and whether the occupant is a PE read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct SingleEntry {
     idx: usize,
     is_paired: bool,
 }
 
-pub fn markdup(
-    input: &Path,
-    output: &mut dyn Write,
-    opts: &MarkdupOpts,
-    workers: NonZero<usize>,
-) -> Result<MarkdupStats> {
-    let mut reader = rsomics_bamio::open_with_workers(input, workers)?;
-    let header = reader.read_header().map_err(RsomicsError::Io)?;
-
-    let mut records: Vec<bam::Record> = Vec::new();
-    for result in reader.records() {
-        records.push(result.map_err(RsomicsError::Io)?);
-    }
-
+/// Mark per-record `is_dup` flags using the position-keyed two-hash detection
+/// that mirrors samtools markdup. Returns a bitmap parallel to `records`.
+fn detect_duplicates(records: &[RawRecord]) -> Vec<bool> {
     // --- Pass 1: resolve mate unclipped-5' coordinates for paired reads. ---
     //
     // samtools markdup requires the MC (mate CIGAR) tag from fixmate to compute
     // the mate's unclipped position.  We instead do a name-grouping pass over
     // the already-loaded records, giving us both ends without requiring fixmate.
-    let mut mate_5p_map: HashMap<usize, i64> = HashMap::new();
+    // Mate's resolved unclipped-5' coord per record index, or `None` for reads
+    // with no mate to pair. Indexed by record position to avoid a second hash.
+    let mut mate_5p: Vec<Option<i64>> = vec![None; records.len()];
     {
-        let mut name_to_idxs: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        // Name keys borrow from `records` (immutable here) — no per-read clone.
+        let mut name_to_idxs: HashMap<&[u8], Vec<usize>> = HashMap::new();
         for (i, r) in records.iter().enumerate() {
             let f = r.flags();
-            if f.is_unmapped() || f.is_secondary() || f.is_supplementary() {
+            if f & (FLAG_UNMAPPED | FLAG_SECONDARY | FLAG_SUPPLEMENTARY) != 0 {
                 continue;
             }
-            if f.is_segmented() && !f.is_mate_unmapped() {
-                name_to_idxs.entry(read_name(r)).or_default().push(i);
+            if f & FLAG_SEGMENTED != 0 && f & FLAG_MATE_UNMAPPED == 0 {
+                name_to_idxs.entry(r.name()).or_default().push(i);
             }
         }
         for idxs in name_to_idxs.values() {
@@ -269,10 +241,14 @@ pub fn markdup(
                 continue;
             }
             let (i0, i1) = (idxs[0], idxs[1]);
-            mate_5p_map.insert(i0, unclipped_5p(&records[i1]));
-            mate_5p_map.insert(i1, unclipped_5p(&records[i0]));
+            mate_5p[i0] = Some(unclipped_5p(&records[i1]));
+            mate_5p[i1] = Some(unclipped_5p(&records[i0]));
         }
     }
+
+    // Base-quality score per record, computed once (the SE-vs-SE collision rule
+    // needs the incumbent's score, so caching avoids a second CIGAR-free walk).
+    let scores: Vec<i64> = records.iter().map(base_qual_sum).collect();
 
     // --- Pass 2: position-keyed duplicate detection. ---
     //
@@ -301,16 +277,17 @@ pub fn markdup(
 
     for (i, record) in records.iter().enumerate() {
         let f = record.flags();
-        if f.is_unmapped() || f.is_secondary() || f.is_supplementary() {
+        if f & (FLAG_UNMAPPED | FLAG_SECONDARY | FLAG_SUPPLEMENTARY) != 0 {
             continue;
         }
 
         let sk = single_key_for(record);
-        let score = base_qual_sum(record);
-        let is_paired = f.is_segmented() && !f.is_mate_unmapped() && mate_5p_map.contains_key(&i);
+        let score = scores[i];
+        let is_paired =
+            f & FLAG_SEGMENTED != 0 && f & FLAG_MATE_UNMAPPED == 0 && mate_5p[i].is_some();
 
         // --- single_hash: every read registers its own-end key ---
-        match single_hash.get(&sk).cloned() {
+        match single_hash.get(&sk).copied() {
             None => {
                 single_hash.insert(sk.clone(), SingleEntry { idx: i, is_paired });
             }
@@ -331,7 +308,7 @@ pub fn markdup(
             }
             Some(existing) if !existing.is_paired && !is_paired => {
                 // SE vs SE: higher score wins; ties keep the first (coordinate order).
-                let old_score = base_qual_sum(&records[existing.idx]);
+                let old_score = scores[existing.idx];
                 if score > old_score {
                     is_dup[existing.idx] = true;
                     single_hash.insert(
@@ -351,9 +328,8 @@ pub fn markdup(
         }
 
         // --- pair_hash: only for reads with a resolved mate ---
-        if is_paired {
-            let mate_5p = mate_5p_map[&i];
-            let pk = pair_key_for(record, mate_5p);
+        if let Some(mate_coord) = mate_5p[i] {
+            let pk = pair_key_for(record, mate_coord);
 
             match pair_hash.get(&pk).copied() {
                 None => {
@@ -372,8 +348,49 @@ pub fn markdup(
         }
     }
 
-    let mut writer = bam::io::Writer::new(output);
-    writer.write_header(&header).map_err(RsomicsError::Io)?;
+    is_dup
+}
+
+/// Read every record raw, detect duplicates, then for each duplicate set the
+/// 0x400 flag in place and emit the raw bytes — seq/qual/cigar/name are never
+/// decoded or re-encoded. `output_path` of `None` writes BAM to stdout.
+pub fn markdup(
+    input: &Path,
+    output_path: Option<&Path>,
+    opts: &MarkdupOpts,
+    workers: NonZero<usize>,
+) -> Result<MarkdupStats> {
+    let mut reader = rsomics_bamio::open_with_workers(input, workers)?;
+    let header = reader.read_header().map_err(RsomicsError::Io)?;
+
+    let mut records: Vec<RawRecord> = Vec::new();
+    let mut rec = RawRecord::default();
+    while raw::read_record(reader.get_mut(), &mut rec)? != 0 {
+        records.push(std::mem::take(&mut rec));
+    }
+
+    let is_dup = detect_duplicates(&records);
+
+    match output_path {
+        Some(path) => {
+            let mut writer = rsomics_bamio::create_with_workers(path, workers)?;
+            write_records(&mut writer, &header, &records, &is_dup, opts)
+        }
+        None => {
+            let mut writer = bam::io::Writer::new(std::io::stdout().lock());
+            write_records(&mut writer, &header, &records, &is_dup, opts)
+        }
+    }
+}
+
+fn write_records<W: Write>(
+    writer: &mut bam::io::Writer<W>,
+    header: &noodles::sam::Header,
+    records: &[RawRecord],
+    is_dup: &[bool],
+    opts: &MarkdupOpts,
+) -> Result<MarkdupStats> {
+    writer.write_header(header).map_err(RsomicsError::Io)?;
 
     let mut stats = MarkdupStats {
         total: records.len() as u64,
@@ -387,16 +404,11 @@ pub fn markdup(
                 continue;
             }
             stats.duplicates_marked += 1;
-            let mut buf =
-                RecordBuf::try_from_alignment_record(&header, record).map_err(RsomicsError::Io)?;
-            *buf.flags_mut() |= sam::alignment::record::Flags::DUPLICATE;
-            writer
-                .write_alignment_record(&header, &buf)
-                .map_err(RsomicsError::Io)?;
+            let mut edited = record.clone();
+            edited.set_flag_bits(FLAG_DUPLICATE);
+            raw::write_record(writer.get_mut(), &edited)?;
         } else {
-            writer
-                .write_record(&header, record)
-                .map_err(RsomicsError::Io)?;
+            raw::write_record(writer.get_mut(), record)?;
         }
     }
 
