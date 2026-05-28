@@ -12,6 +12,11 @@ description = "Mark or remove PCR/optical duplicates in sorted BAM — Rust port
 name = "rsomics-bam-markdup"
 path = "src/main.rs"
 
+
+[lib]
+name = "rsomics_bam_markdup"
+path = "src/lib.rs"
+doctest = false
 [dependencies]
 rsomics-common = { version = "0.6" }
 rsomics-bamio = { version = "0.1.4" }
