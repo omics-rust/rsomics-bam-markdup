@@ -54,7 +54,6 @@ pub struct MarkdupOpts {
     pub remove: bool,
 }
 
-/// Sum of base qualities >= 15 (samtools `calc_score`).
 fn calc_score(r: &RawRecord) -> i64 {
     r.quality_scores()
         .iter()
@@ -63,9 +62,6 @@ fn calc_score(r: &RawRecord) -> i64 {
         .sum()
 }
 
-/// Decode the `ms` mate-score tag, accepting any BAM integer subtype
-/// (`c`/`C`/`s`/`S`/`i`/`I`) exactly as samtools `bam_aux2i` does. Absent or
-/// non-integer `ms` is a hard error: the file was not fixmate-m'd.
 fn mate_score(r: &RawRecord) -> Result<i64> {
     let ty = r.aux_type(*b"ms").ok_or_else(no_ms_error)?;
     let v = r.aux_value(*b"ms").ok_or_else(no_ms_error)?;
@@ -93,17 +89,12 @@ fn no_mc_error() -> RsomicsError {
     RsomicsError::InvalidInput("no MC tag. Run samtools fixmate -m on the file first.".into())
 }
 
-/// A read with a mate: paired, mate mapped, mate reference/pos present.
-/// Mirrors samtools `has_mate`.
 fn has_mate(r: &RawRecord) -> bool {
     r.flags() & FLAG_PAIRED != 0
         && r.flags() & FLAG_MATE_UNMAPPED == 0
         && !(r.mate_reference_sequence_id() == -1 && r.mate_alignment_start() == -1)
 }
 
-/// A buffered read awaiting flush. Holds its raw bytes, the window position
-/// (the single key's `this_coord`), its raw tid, and the hash keys it occupies
-/// so they can be removed on flush.
 struct Buffered {
     record: RawRecord,
     is_dup: bool,
@@ -115,14 +106,9 @@ struct Buffered {
     pair_key: Option<PairKey>,
 }
 
-/// Value stored in the single/pair hashes: the buffer index of the occupying
-/// read. Generation-tagged buffer indices are unnecessary because flushed reads
-/// remove their own slots before the index could be reused.
 type SingleHash = HashMap<SingleKey, usize>;
 type PairHash = HashMap<PairKey, usize>;
 
-/// Streaming duplicate marker. Owns the sliding-window buffer and the two
-/// position hashes; emits finalized records to `writer` in input order.
 struct Marker<'a, W: Write> {
     writer: &'a mut bam::io::Writer<W>,
     opts: &'a MarkdupOpts,
@@ -159,10 +145,6 @@ impl<'a, W: Write> Marker<'a, W> {
         &mut self.buffer[abs_idx - self.base]
     }
 
-    /// Process one record: build keys, resolve duplicates against the live
-    /// window hashes, then push it onto the buffer. Excluded reads (secondary /
-    /// supplementary / unmapped / QC-fail) are buffered untouched so they emit
-    /// in order.
     fn process(&mut self, record: RawRecord) -> Result<()> {
         self.stats.total += 1;
         let flags = record.flags();
@@ -221,8 +203,7 @@ impl<'a, W: Write> Marker<'a, W> {
         Ok(())
     }
 
-    /// single_hash interaction. `paired` marks whether the incoming read has a
-    /// mate (its slot wins over singletons that later collide).
+    // `paired` wins the slot over any singleton that collides.
     fn resolve_single(
         &mut self,
         buffered: &mut Buffered,
@@ -272,7 +253,6 @@ impl<'a, W: Write> Marker<'a, W> {
         Ok(())
     }
 
-    /// pair_hash interaction with the summed-mate-score tie-break.
     fn resolve_pair(
         &mut self,
         buffered: &mut Buffered,
@@ -325,9 +305,6 @@ impl<'a, W: Write> Marker<'a, W> {
         Ok(())
     }
 
-    /// Mark a buffered read as a duplicate, accounting for it once. A read marked
-    /// from the single hash and then re-evaluated cannot double-count because
-    /// the slot's `single_key`/`pair_key` are cleared on the same step.
     fn mark_dup(&mut self, abs_idx: usize) {
         let slot = self.slot_mut(abs_idx);
         if !slot.is_dup {
@@ -340,10 +317,7 @@ impl<'a, W: Write> Marker<'a, W> {
         self.buffer.push_back(b);
     }
 
-    /// Flush every buffered read that has fallen out of the window relative to
-    /// the current read's raw `(pos, tid)`. samtools keeps a read while
-    /// `read.pos + max_length > cur_pos && read.tid == cur_tid`; everything else
-    /// is finalized, its hash slots removed, and written out.
+    // samtools: keep while `read.pos + max_length > cur_pos && read.tid == cur_tid`.
     fn flush_window(&mut self, cur_pos: i64, cur_tid: i32) -> Result<()> {
         while let Some(front) = self.buffer.front() {
             let keep = front.pos + self.max_length > cur_pos
@@ -357,8 +331,6 @@ impl<'a, W: Write> Marker<'a, W> {
         Ok(())
     }
 
-    /// Remove the front buffered read's hash slots and write it out (or skip on
-    /// remove). Advances `base`.
     fn emit_front(&mut self) -> Result<()> {
         let b = self.buffer.pop_front().expect("emit_front on empty buffer");
         self.base += 1;
@@ -386,7 +358,6 @@ impl<'a, W: Write> Marker<'a, W> {
         Ok(())
     }
 
-    /// Flush all remaining buffered reads at end of stream.
     fn finish(mut self) -> Result<MarkdupStats> {
         while !self.buffer.is_empty() {
             self.emit_front()?;
@@ -395,8 +366,6 @@ impl<'a, W: Write> Marker<'a, W> {
     }
 }
 
-/// Stream `input` (coordinate-sorted, fixmate-m'd) and emit duplicate-marked
-/// records. `output_path` of `None` writes BAM to stdout.
 pub fn markdup(
     input: &Path,
     output_path: Option<&Path>,

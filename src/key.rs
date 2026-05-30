@@ -47,7 +47,6 @@ fn is_read1(r: &RawRecord) -> bool {
     r.flags() & FLAG_READ1 != 0
 }
 
-/// Whether a CIGAR op consumes reference bases (M/D/N/=/X).
 #[inline]
 fn consumes_ref(op: u8) -> bool {
     matches!(
@@ -162,10 +161,7 @@ pub fn unclipped_other_end(mate_pos: i64, mc: &[u8]) -> i64 {
     mate_pos + refpos
 }
 
-/// Single-read key: `(this_ref, this_coord, orientation)` plus the per-read
-/// `single` discriminant. `this_ref` is `tid + 1` (samtools offsets to keep 0
-/// out of the hash; equality is preserved either way). Reverse reads key on the
-/// unclipped end with O_RR; forward reads on the unclipped start with O_FF.
+// tid+1: samtools offsets to keep 0 out of the hash (equality preserved).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SingleKey {
     pub this_ref: i32,
@@ -173,9 +169,6 @@ pub struct SingleKey {
     pub orientation: i8,
 }
 
-/// Pair key: both ends' unclipped coordinates, references, the leftmost flag and
-/// the pair orientation. Built from one read's perspective via the MC tag, so
-/// the two mates of a template yield distinct keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PairKey {
     pub this_ref: i32,
@@ -186,8 +179,6 @@ pub struct PairKey {
     pub orientation: i8,
 }
 
-/// Build the single key (samtools `make_single_key`). Returns the key and the
-/// `this_coord` value samtools stores back as the read's window position.
 pub fn make_single_key(r: &RawRecord) -> SingleKey {
     let this_ref = r.reference_sequence_id() + 1;
     let (this_coord, orientation) = if is_reverse(r) {
@@ -202,9 +193,6 @@ pub fn make_single_key(r: &RawRecord) -> SingleKey {
     }
 }
 
-/// Build the pair key in template mode (samtools `make_pair_key`,
-/// `MD_MODE_TEMPLATE`). The MC tag supplies the mate CIGAR for the mate's
-/// unclipped coordinates. Returns the key.
 pub fn make_pair_key(r: &RawRecord, mc: &[u8]) -> PairKey {
     let this_ref = r.reference_sequence_id() + 1;
     let other_ref = r.mate_reference_sequence_id() + 1;
